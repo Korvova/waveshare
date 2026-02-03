@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# MicroPython
+*.pyc
+
+# Downloaded firmware and libraries
+*.zip
+RP2350-ETH-8DI-8RO/
+WAVESHARE_RP2350B/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+test_*.py
+check_*.py
+list_ports.py
