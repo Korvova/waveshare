@@ -2,7 +2,7 @@
 Simple Web Server for Waveshare RP2350-POE-ETH-8DI-8RO
 Using custom W5500 driver
 """
-from machine import Pin, SoftSPI
+from machine import Pin, SoftSPI, UART
 from w5500_simple import W5500
 import dht
 import time
@@ -29,6 +29,10 @@ DHT_PIN = 42
 
 # Digital inputs (door sensor on D1)
 DI1_PIN = 9  # Door sensor
+
+# PZEM-004T power meter (UART)
+PZEM_TX = 40
+PZEM_RX = 43
 
 # ============= LOGGING =============
 LOG_SIZE = 20  # Keep last 20 entries
@@ -81,6 +85,10 @@ door_pin = Pin(DI1_PIN, Pin.IN, Pin.PULL_UP)
 print(f"Door sensor on D1 (GPIO {DI1_PIN})")
 last_door_state = door_pin.value()
 
+# PZEM-004T power meter
+pzem_uart = UART(1, baudrate=9600, tx=Pin(PZEM_TX), rx=Pin(PZEM_RX))
+print(f"PZEM on TX={PZEM_TX}, RX={PZEM_RX}")
+
 # SPI & W5500
 cs = Pin(SPI_CS, Pin.OUT, value=1)
 rst = Pin(W5500_RST, Pin.OUT)
@@ -128,6 +136,58 @@ def read_dht():
     except:
         return dht_cache  # Return old value on error
 
+# PZEM cache
+pzem_cache = {'v': None, 'a': None, 'w': None, 'wh': None, 'hz': None, 'pf': None}
+pzem_last_read = 0
+
+def pzem_crc16(data):
+    """Calculate Modbus CRC16"""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc
+
+def read_pzem():
+    """Read PZEM-004T power meter (cached 2s, expires after 5s)"""
+    global pzem_cache, pzem_last_read
+    now = time.ticks_ms()
+    # Only read every 2 seconds
+    if time.ticks_diff(now, pzem_last_read) < 2000 and pzem_cache['v'] is not None:
+        return pzem_cache
+    # If cache is older than 5s, clear it (PZEM not responding)
+    if time.ticks_diff(now, pzem_last_read) > 5000:
+        pzem_cache = {'v': None, 'a': None, 'w': None, 'wh': None, 'hz': None, 'pf': None}
+    try:
+        # Clear buffer
+        while pzem_uart.any():
+            pzem_uart.read()
+        # Send read command
+        cmd = bytes([0x01, 0x04, 0x00, 0x00, 0x00, 0x0A])
+        crc = pzem_crc16(cmd)
+        cmd = cmd + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+        pzem_uart.write(cmd)
+        time.sleep_ms(100)
+        if pzem_uart.any():
+            r = pzem_uart.read()
+            if len(r) >= 25:
+                pzem_cache = {
+                    'v': (r[3] << 8 | r[4]) / 10.0,
+                    'a': (r[5] << 8 | r[6] | r[7] << 24 | r[8] << 16) / 1000.0,
+                    'w': (r[9] << 8 | r[10] | r[11] << 24 | r[12] << 16) / 10.0,
+                    'wh': r[13] << 8 | r[14] | r[15] << 24 | r[16] << 16,
+                    'hz': (r[17] << 8 | r[18]) / 10.0,
+                    'pf': (r[19] << 8 | r[20]) / 100.0
+                }
+                pzem_last_read = now
+    except:
+        pass
+    return pzem_cache
+
 def read_all_gpio():
     """Read all GPIO pins (0-47)"""
     values = []
@@ -147,11 +207,17 @@ def html_page():
     door_val = door_pin.value()
     door_str = "🔒 ДВЕРЬ ЗАКРЫТА" if door_val else "🔓 ДВЕРЬ ОТКРЫТА"
     door_color = "#f44336" if door_val else "#4CAF50"  # red=closed, green=open
+    # PZEM power meter
+    pz = read_pzem()
+    pz_v = f"{pz['v']:.1f}" if pz['v'] else "--"
+    pz_a = f"{pz['a']:.2f}" if pz['a'] is not None else "--"
+    pz_w = f"{pz['w']:.1f}" if pz['w'] is not None else "--"
 
     # Build body first (no auto-refresh, use AJAX)
     body = f"""<!DOCTYPE html><html><head><meta charset='UTF-8'><title>RP2350</title>
 <style>body{{font-family:Arial;margin:20px}}
 .sensor{{background:#2196F3;color:#fff;padding:20px;border-radius:10px;margin:10px 0;font-size:20px}}
+.power{{background:#9C27B0;color:#fff;padding:20px;border-radius:10px;margin:10px 0;font-size:18px}}
 .r{{margin:8px;padding:8px;background:#eee;border-radius:5px}}
 .on{{background:#4CAF50;color:#fff;padding:6px 12px;border:none;cursor:pointer}}
 .off{{background:#f44336;color:#fff;padding:6px 12px;border:none;cursor:pointer}}
@@ -172,6 +238,9 @@ for(var i=0;i<8;i++)document.getElementById('s'+i).innerText=d.r[i]?'ON':'OFF';
 var de=document.getElementById('door');
 de.innerText=d.d?'🔒 ДВЕРЬ ЗАКРЫТА':'🔓 ДВЕРЬ ОТКРЫТА';
 de.parentElement.style.background=d.d?'#f44336':'#4CAF50';
+if(d.pz){{document.getElementById('pz_v').innerText=d.pz.v?d.pz.v.toFixed(1):'--';
+document.getElementById('pz_a').innerText=d.pz.a!=null?d.pz.a.toFixed(2):'--';
+document.getElementById('pz_w').innerText=d.pz.w!=null?d.pz.w.toFixed(1):'--';}}
 }}).catch(()=>{{}});
 }}
 setInterval(upd,2000);
@@ -179,6 +248,7 @@ setInterval(upd,2000);
 </head><body><h1>RP2350 Control</h1>
 <div class='sensor'>Temp: <b id='temp'>{temp_str}</b> C | Humidity: <b id='hum'>{hum_str}</b>%</div>
 <div class='sensor' style='background:{door_color}'><b id='door'>{door_str}</b></div>
+<div class='power'>⚡ <b id='pz_v'>{pz_v}</b> V | <b id='pz_a'>{pz_a}</b> A | <b id='pz_w'>{pz_w}</b> W</div>
 <h2>Relays</h2>"""
 
     for i in range(8):
@@ -254,11 +324,18 @@ def handle_request(req):
         t, h = read_dht()
         states = [relays[i].value() for i in range(8)]
         door = door_pin.value()
-        json = '{"t":%s,"h":%s,"r":[%s],"d":%d}' % (
+        pz = read_pzem()
+        pz_json = '"pz":{"v":%s,"a":%s,"w":%s}' % (
+            pz['v'] if pz['v'] else 'null',
+            pz['a'] if pz['a'] is not None else 'null',
+            pz['w'] if pz['w'] is not None else 'null'
+        )
+        json = '{"t":%s,"h":%s,"r":[%s],"d":%d,%s}' % (
             t if t else 'null',
             h if h else 'null',
             ','.join(str(s) for s in states),
-            door
+            door,
+            pz_json
         )
         headers = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(json)}\r\nConnection: close\r\n\r\n"
         return headers.encode() + json.encode()
