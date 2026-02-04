@@ -70,9 +70,7 @@ print(f"IP: {ip[0]}.{ip[1]}.{ip[2]}.{ip[3]}")
 def read_dht():
     """Read temperature and humidity from DHT22"""
     try:
-        time.sleep_ms(500)  # Wait before reading
         dht_sensor.measure()
-        time.sleep_ms(100)  # Wait after measure
         t = dht_sensor.temperature()
         h = dht_sensor.humidity()
         print(f"DHT: {t}C, {h}%")
@@ -160,24 +158,48 @@ SOCK = 0
 print(f"\nStarting server on http://{ip[0]}.{ip[1]}.{ip[2]}.{ip[3]}:80")
 print("=" * 40)
 
+idle_count = 0
+link_check = 0
+
 while True:
     try:
+        # Check link every 100 iterations
+        link_check += 1
+        if link_check >= 100:
+            link_check = 0
+            if not w5500.get_link_status():
+                print("Link lost! Waiting...")
+                w5500.socket_close(SOCK)
+                while not w5500.get_link_status():
+                    time.sleep_ms(500)
+                print("Link restored!")
+                idle_count = 0
+                continue
+
         status = w5500.socket_status(SOCK)
 
         if status == W5500.SOCK_CLOSED:
             if w5500.socket_open(SOCK, 80):
                 print("Socket opened")
+                idle_count = 0
 
         elif status == W5500.SOCK_INIT:
             if w5500.socket_listen(SOCK):
                 print("Listening on :80...")
 
         elif status == W5500.SOCK_LISTEN_STATUS:
-            time.sleep_ms(10)  # Wait for connection
+            idle_count += 1
+            # If stuck listening too long, reset socket
+            if idle_count > 500:
+                print("Idle timeout, resetting...")
+                w5500.socket_close(SOCK)
+                idle_count = 0
+            time.sleep_ms(20)
 
         elif status == W5500.SOCK_ESTABLISHED:
+            idle_count = 0
             # Wait a bit for data
-            time.sleep_ms(100)
+            time.sleep_ms(50)
             avail = w5500.socket_recv_available(SOCK)
             if avail > 0:
                 req = w5500.socket_recv(SOCK, min(avail, 512))
@@ -193,7 +215,7 @@ while True:
                     print(f"Handler error: {e}")
             # Disconnect and close
             w5500.socket_disconnect(SOCK)
-            time.sleep_ms(100)
+            time.sleep_ms(50)
             w5500.socket_close(SOCK)
             time.sleep_ms(50)
 
@@ -203,8 +225,9 @@ while True:
 
         else:
             # Unknown status - close and reopen
+            print(f"Unknown status {status}, resetting...")
             w5500.socket_close(SOCK)
-            time.sleep_ms(50)
+            time.sleep_ms(100)
 
     except Exception as e:
         print(f"Error: {e}")
@@ -212,4 +235,4 @@ while True:
             w5500.socket_close(SOCK)
         except:
             pass
-        time.sleep_ms(200)
+        time.sleep_ms(500)
