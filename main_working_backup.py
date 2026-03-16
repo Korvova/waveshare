@@ -53,6 +53,9 @@ DHT_PIN = 42
 DI1_PIN = 9  # Door sensor
 BUTTON_PIN = 10  # Button on D12 (GPIO 10)
 
+# Reboot flag
+pending_reboot = False
+
 # ============= LOGGING =============
 LOG_SIZE = 20  # Keep last 20 entries
 logs = []
@@ -178,8 +181,8 @@ def html_page():
 
     # Button: 0=pressed (active low), 1=idle
     btn_val = button_pin.value()
-    btn_str = "BUTTON PRESSED" if not btn_val else "Button idle"
-    btn_color = "#4CAF50" if not btn_val else "#9E9E9E"
+    btn_str = "Resetting IP..." if not btn_val else "Reset IP: 192.168.1.100"
+    btn_color = "#f44336" if not btn_val else "#607D8B"
 
     # Build body first (no auto-refresh, use AJAX)
     body = f"""<!DOCTYPE html><html><head><meta charset='UTF-8'><title>RP2350</title>
@@ -206,8 +209,8 @@ var de=document.getElementById('door');
 de.innerText=d.d?'DOOR CLOSED':'DOOR OPEN';
 de.parentElement.style.background=d.d?'#f44336':'#4CAF50';
 var be=document.getElementById('btn');
-be.innerText=d.b?'Button idle':'BUTTON PRESSED';
-be.parentElement.style.background=d.b?'#9E9E9E':'#4CAF50';
+be.innerText=d.b?'Reset IP: 192.168.1.100':'Resetting IP...';
+be.parentElement.style.background=d.b?'#607D8B':'#f44336';
 }}).catch(()=>{{}});
 }}
 setInterval(upd,500);
@@ -334,14 +337,9 @@ label{{display:inline-block;width:120px}}.btn{{background:#2196F3;color:#fff;pad
             new_sn = params.get('sn', sn_str)
             save_net_config(new_ip, new_gw, new_sn)
             log(f"Network config saved: {new_ip}")
-            import machine
+            global pending_reboot
+            pending_reboot = True
             resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body><h2>Saved! Rebooting...</h2><p>New IP: " + new_ip.encode() + b"</p></body></html>"
-            # Schedule reboot after response
-            import _thread
-            def _reboot():
-                time.sleep_ms(500)
-                machine.reset()
-            _thread.start_new_thread(_reboot, ())
             return resp
         except Exception as e:
             log(f"Settings save error: {e}")
@@ -367,6 +365,12 @@ link_check = 0
 
 while True:
     try:
+        # Check reboot flag
+        if pending_reboot:
+            time.sleep_ms(500)
+            import machine
+            machine.reset()
+
         # Check pending pulse tasks
         check_pulses()
 
@@ -378,16 +382,19 @@ while True:
             log(f"DOOR: {state_str}")
             print(f">>> DOOR STATE CHANGED: {state_str} <<<")
 
-        # Check button state change
+        # Check button state change — reset IP to default on press
         btn_now = button_pin.value()
         if btn_now != last_button_state:
             last_button_state = btn_now
             if not btn_now:
-                log("BUTTON: PRESSED")
-                print(">>> BUTTON PRESSED <<<")
-            else:
-                log("BUTTON: released")
-                print(">>> button released <<<")
+                log("BUTTON: reset IP to default")
+                print(">>> BUTTON: resetting IP to default <<<")
+                try:
+                    import uos
+                    uos.remove(NET_CONFIG_FILE)
+                except:
+                    pass
+                pending_reboot = True
 
         # Check link every 100 iterations
         link_check += 1
@@ -424,11 +431,26 @@ while True:
 
         elif status == W5500.SOCK_ESTABLISHED:
             idle_count = 0
-            # Wait a bit for data
-            time.sleep_ms(50)
+            # Wait for data
+            time.sleep_ms(100)
             avail = w5500.socket_recv_available(SOCK)
             if avail > 0:
-                req = w5500.socket_recv(SOCK, min(avail, 512))
+                req = w5500.socket_recv(SOCK, min(avail, 1024))
+                # For POST: wait and read body if not yet received
+                if b'POST' in req and b'\r\n\r\n' in req:
+                    header_end = req.find(b'\r\n\r\n') + 4
+                    cl = 0
+                    for line in req[:header_end].split(b'\r\n'):
+                        if b'Content-Length:' in line or b'content-length:' in line:
+                            try:
+                                cl = int(line.split(b':')[1].strip())
+                            except:
+                                pass
+                    if len(req) - header_end < cl:
+                        time.sleep_ms(200)
+                        more = w5500.socket_recv_available(SOCK)
+                        if more > 0:
+                            req += w5500.socket_recv(SOCK, more)
                 print(f"Request: {len(req)} bytes")
                 try:
                     print("Building response...")
