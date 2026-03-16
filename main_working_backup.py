@@ -6,6 +6,7 @@ from machine import Pin, SoftSPI
 from w5500_simple import W5500
 import dht
 import time
+import json
 
 # ============= CONFIGURATION =============
 # W5500 SPI pins
@@ -15,11 +16,32 @@ SPI_MISO = 36
 SPI_CS   = 33
 W5500_RST = 25
 
-# Network
+# Network defaults (used if no config file)
 MAC = [0x00, 0x08, 0xDC, 0x12, 0x34, 0x56]
-IP = [192, 168, 1, 100]
-GW = [192, 168, 1, 1]
-SN = [255, 255, 255, 0]
+_DEFAULT_IP = '192.168.1.100'
+_DEFAULT_GW = '192.168.1.1'
+_DEFAULT_SN = '255.255.255.0'
+NET_CONFIG_FILE = '/net_config.json'
+
+def load_net_config():
+    try:
+        with open(NET_CONFIG_FILE) as f:
+            c = json.load(f)
+        return c['ip'], c['gw'], c['sn']
+    except:
+        return _DEFAULT_IP, _DEFAULT_GW, _DEFAULT_SN
+
+def save_net_config(ip_str, gw_str, sn_str):
+    with open(NET_CONFIG_FILE, 'w') as f:
+        json.dump({'ip': ip_str, 'gw': gw_str, 'sn': sn_str}, f)
+
+def str_to_list(s):
+    return [int(x) for x in s.split('.')]
+
+ip_str, gw_str, sn_str = load_net_config()
+IP = str_to_list(ip_str)
+GW = str_to_list(gw_str)
+SN = str_to_list(sn_str)
 
 # Relay pins
 RELAY_PINS = [17, 18, 19, 20, 21, 22, 23, 24]
@@ -191,6 +213,7 @@ be.parentElement.style.background=d.b?'#9E9E9E':'#4CAF50';
 setInterval(upd,500);
 </script>
 </head><body><h1>RP2350 Control</h1>
+<p style='text-align:center;color:#666;margin-bottom:15px'>IP: {ip[0]}.{ip[1]}.{ip[2]}.{ip[3]}</p>
 <div class='sensor'>Temp: <b id='temp'>{temp_str}</b> C | Humidity: <b id='hum'>{hum_str}</b>%</div>
 <div class='sensor' style='background:{door_color}'><b id='door'>{door_str}</b></div>
 <div class='sensor' style='background:{btn_color}'><b id='btn'>{btn_str}</b></div>
@@ -205,7 +228,8 @@ setInterval(upd,500);
 
     body += "<hr><a href='/a?s=1'><button class='on'>ALL ON</button></a> "
     body += "<a href='/a?s=0'><button class='off'>ALL OFF</button></a> "
-    body += "<a href='/log'><button style='background:#666;color:#fff;padding:6px 12px;border:none'>LOGS</button></a>"
+    body += "<a href='/log'><button style='background:#666;color:#fff;padding:6px 12px;border:none'>LOGS</button></a> "
+    body += "<a href='/settings'><button style='background:#2196F3;color:#fff;padding:6px 12px;border:none'>SETTINGS</button></a>"
 
     # GPIO status - disabled (causes socket timeout)
     # body += "<h2>GPIO</h2><pre>...</pre>"
@@ -279,6 +303,49 @@ def handle_request(req):
         )
         headers = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(json)}\r\nConnection: close\r\n\r\n"
         return headers.encode() + json.encode()
+
+    elif b'GET /settings' in req:
+        body = f"""<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Settings</title>
+<style>body{{font-family:Arial;margin:20px}}input{{padding:6px;width:180px;margin:4px 0}}
+label{{display:inline-block;width:120px}}.btn{{background:#2196F3;color:#fff;padding:8px 20px;border:none;cursor:pointer;margin-top:10px}}</style>
+</head><body><h1>Network Settings</h1>
+<form method='POST' action='/save_settings'>
+<p><label>IP Address:</label><input name='ip' value='{ip_str}'></p>
+<p><label>Gateway:</label><input name='gw' value='{gw_str}'></p>
+<p><label>Subnet Mask:</label><input name='sn' value='{sn_str}'></p>
+<button class='btn' type='submit'>Save &amp; Reboot</button>
+</form>
+<br><a href='/'>Back</a></body></html>"""
+        body_bytes = body.encode()
+        headers = f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(body_bytes)}\r\nConnection: close\r\n\r\n"
+        return headers.encode() + body_bytes
+
+    elif b'POST /save_settings' in req:
+        try:
+            s = req.decode()
+            body_part = s.split('\r\n\r\n', 1)[1] if '\r\n\r\n' in s else ''
+            params = {}
+            for pair in body_part.split('&'):
+                if '=' in pair:
+                    k, v = pair.split('=', 1)
+                    params[k.strip()] = v.strip().replace('%2F', '/').replace('+', ' ')
+            new_ip = params.get('ip', ip_str)
+            new_gw = params.get('gw', gw_str)
+            new_sn = params.get('sn', sn_str)
+            save_net_config(new_ip, new_gw, new_sn)
+            log(f"Network config saved: {new_ip}")
+            import machine
+            resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body><h2>Saved! Rebooting...</h2><p>New IP: " + new_ip.encode() + b"</p></body></html>"
+            # Schedule reboot after response
+            import _thread
+            def _reboot():
+                time.sleep_ms(500)
+                machine.reset()
+            _thread.start_new_thread(_reboot, ())
+            return resp
+        except Exception as e:
+            log(f"Settings save error: {e}")
+            return b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 
     elif b'GET /log' in req:
         # Plain text logs (minimal)
