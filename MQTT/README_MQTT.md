@@ -9,6 +9,9 @@
 - Настройки MQTT прямо в вебке (Enable, Broker IP, Broker Port, Base Topic)
 - Кнопка `Test MQTT` в вебке
 - MQTT publish + subscribe (двусторонняя работа)
+- Door 1 (DI1/GPIO9) и Door 2 (DI2/GPIO10) в вебке и API
+- DI3..DI8 (GPIO11..16) с отображением состояния `OPEN/CLOSED`
+- Настройка логики DI3..DI8 из вебки (`ACTIVE=CLOSED` / `ACTIVE=OPEN`)
 
 ## Важно по архитектуре
 
@@ -60,3 +63,16 @@ mpremote connect COM13 reset
 - `main.py` — основная прошивка (web + optional mqtt)
 - `w5500_simple.py` — драйвер W5500 (добавлен `socket_connect`)
 - `README_MQTT.md` — эта документация
+
+## API (HTTP)
+
+- `GET /api/state` — текущее состояние
+  - `door_closed` (DI1), `door2_closed` (DI2)
+  - `di` для DI3..DI8
+  - `di_pull_modes` для DI3..DI8
+- `POST /api/relay` — управление реле
+  - `{"relay":7,"state":"OFF"}`
+  - `{"all":"ON"}`
+- `POST /api/di/config` — настройка логики DI3..DI8
+  - `{"di":3,"mode":"HIGH"}` -> `ACTIVE=CLOSED`
+  - `{"di":3,"mode":"LOW"}` -> `ACTIVE=OPEN`

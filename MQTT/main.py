@@ -11,6 +11,7 @@ from machine import Pin, SoftSPI
 from w5500_simple import W5500
 import time
 import json
+import dht
 
 # ===================== Hardware =====================
 SPI_SCK = 34
@@ -19,6 +20,10 @@ SPI_MISO = 36
 SPI_CS = 33
 W5500_RST = 25
 RELAY_PINS = [17, 18, 19, 20, 21, 22, 23, 24]
+DHT_PIN = 42
+DOOR1_PIN = 9   # DI1
+DOOR2_PIN = 10  # DI2
+DI_PINS = [11, 12, 13, 14, 15, 16]  # DI3..DI8
 
 # ===================== Network =====================
 MAC = [0x00, 0x08, 0xDC, 0x12, 0x34, 0x56]
@@ -37,12 +42,15 @@ SOCK_MQTT = 1
 KEEPALIVE_SEC = 30
 CLIENT_ID = "rp2350-relay-01"
 HEARTBEAT_MS = 15000
+SENSOR_POLL_MS = 2000
+DHT_READ_MS = 30000
 
 mqtt_cfg = {
     "enabled": False,
     "broker_ip": "192.168.1.10",
     "broker_port": 1883,
     "base_topic": "waveshare",
+    "di_pull_modes": [1, 1, 1, 1, 1, 1],  # DI3..DI8: 1=PULL_UP(HIGH), 0=PULL_DOWN(LOW)
 }
 
 mqtt_connected = False
@@ -52,6 +60,13 @@ last_mqtt_rx_ms = 0
 last_mqtt_conn_try_ms = 0
 last_heartbeat_ms = 0
 packet_id = 1
+last_sensor_poll_ms = 0
+dht_last_read_ms = 0
+dht_temp = None
+dht_hum = None
+door_state = None
+door2_state = None
+di_states = [None, None, None, None, None, None]
 
 
 def log(msg):
@@ -68,6 +83,9 @@ def load_mqtt_config():
                 mqtt_cfg["broker_ip"] = str(data.get("broker_ip", mqtt_cfg["broker_ip"]))
                 mqtt_cfg["broker_port"] = int(data.get("broker_port", mqtt_cfg["broker_port"]))
                 mqtt_cfg["base_topic"] = str(data.get("base_topic", mqtt_cfg["base_topic"]))
+                pull_modes = data.get("di_pull_modes", mqtt_cfg["di_pull_modes"])
+                if isinstance(pull_modes, list) and len(pull_modes) == 6:
+                    mqtt_cfg["di_pull_modes"] = [1 if int(v) else 0 for v in pull_modes]
     except:
         pass
 
@@ -123,6 +141,22 @@ def topic_state():
 
 def topic_get():
     return "%s/system/get" % mqtt_cfg["base_topic"]
+
+
+def topic_temp():
+    return "%s/sensor/temperature" % mqtt_cfg["base_topic"]
+
+
+def topic_hum():
+    return "%s/sensor/humidity" % mqtt_cfg["base_topic"]
+
+
+def topic_door():
+    return "%s/door/state" % mqtt_cfg["base_topic"]
+
+
+def topic_door2():
+    return "%s/door2/state" % mqtt_cfg["base_topic"]
 
 
 def encode_str(text):
@@ -199,6 +233,17 @@ def mqtt_publish_online():
     mqtt_publish(topic_online(), "online", retain=True)
 
 
+def mqtt_publish_sensor_values():
+    if dht_temp is not None:
+        mqtt_publish(topic_temp(), ("%.1f" % dht_temp), retain=True)
+    if dht_hum is not None:
+        mqtt_publish(topic_hum(), ("%.1f" % dht_hum), retain=True)
+    if door_state is not None:
+        mqtt_publish(topic_door(), "CLOSED" if door_state else "OPEN", retain=True)
+    if door2_state is not None:
+        mqtt_publish(topic_door2(), "CLOSED" if door2_state else "OPEN", retain=True)
+
+
 def mqtt_publish_heartbeat():
     payload = {
         "uptime_ms": time.ticks_ms(),
@@ -211,6 +256,12 @@ def mqtt_publish_heartbeat():
 def mqtt_publish_state_snapshot():
     payload = {
         "relays": [relays[i].value() for i in range(8)],
+        "temp_c": dht_temp,
+        "hum_pct": dht_hum,
+        "door_closed": door_state,
+        "door2_closed": door2_state,
+        "di": di_states,
+        "di_pull_modes": mqtt_cfg["di_pull_modes"],
         "mqtt_enabled": mqtt_cfg["enabled"],
         "mqtt_connected": mqtt_connected,
         "broker_ip": mqtt_cfg["broker_ip"],
@@ -357,6 +408,7 @@ def mqtt_connect():
     last_heartbeat_ms = now
     mqtt_publish_online()
     mqtt_publish_all_states()
+    mqtt_publish_sensor_values()
     mqtt_publish_state_snapshot()
     mqtt_publish_heartbeat()
     log("MQTT connected")
@@ -372,6 +424,71 @@ def normalize_cmd(payload):
     if p == "TOGGLE":
         return 2
     return None
+
+
+def sensor_loop_step():
+    global dht_last_read_ms, dht_temp, dht_hum, door_state, door2_state, di_states, last_sensor_poll_ms
+
+    now = time.ticks_ms()
+    if time.ticks_diff(now, last_sensor_poll_ms) < SENSOR_POLL_MS:
+        return
+    last_sensor_poll_ms = now
+
+    # Door state: 1=closed, 0=open (pull-up wiring)
+    new_door = 1 if door_pin.value() else 0
+    door_changed = (door_state is None) or (new_door != door_state)
+    if door_changed:
+        door_state = new_door
+        if mqtt_connected:
+            mqtt_publish(topic_door(), "CLOSED" if door_state else "OPEN", retain=True)
+            mqtt_publish_state_snapshot()
+
+    new_door2 = 1 if door2_pin.value() else 0
+    door2_changed = (door2_state is None) or (new_door2 != door2_state)
+    if door2_changed:
+        door2_state = new_door2
+        if mqtt_connected:
+            mqtt_publish(topic_door2(), "CLOSED" if door2_state else "OPEN", retain=True)
+            mqtt_publish_state_snapshot()
+
+    # DI3..DI8 states with configurable pull mode
+    changed_di = False
+    for i in range(6):
+        raw = di_input_pins[i].value()
+        if mqtt_cfg["di_pull_modes"][i] == 1:
+            active = 1 if raw == 0 else 0
+        else:
+            active = 1 if raw == 1 else 0
+        if di_states[i] is None or di_states[i] != active:
+            di_states[i] = active
+            changed_di = True
+    if changed_di and mqtt_connected:
+        mqtt_publish_state_snapshot()
+
+    # DHT read with cache interval
+    if time.ticks_diff(now, dht_last_read_ms) >= DHT_READ_MS or dht_temp is None:
+        try:
+            dht_sensor.measure()
+            new_temp = dht_sensor.temperature()
+            new_hum = dht_sensor.humidity()
+            dht_last_read_ms = now
+
+            changed = (
+                dht_temp is None
+                or dht_hum is None
+                or abs(new_temp - dht_temp) >= 0.1
+                or abs(new_hum - dht_hum) >= 0.1
+            )
+
+            dht_temp = new_temp
+            dht_hum = new_hum
+
+            if changed and mqtt_connected:
+                mqtt_publish_sensor_values()
+                mqtt_publish_state_snapshot()
+        except:
+            # Keep last valid values on sensor errors.
+            pass
 
 
 def apply_relay(idx, cmd, source="unknown"):
@@ -406,6 +523,7 @@ def mqtt_handle_packet(packet):
     if topic == topic_get():
         if mqtt_connected:
             mqtt_publish_all_states()
+            mqtt_publish_sensor_values()
             mqtt_publish_state_snapshot()
             mqtt_publish_heartbeat()
     else:
@@ -498,6 +616,9 @@ def html_page():
         "let t='MQTT Topic Map\\n';"
         "t+='publish from board:\\n';"
         "t+='  '+base+'/relay/<1..8>/state  (ON|OFF, retained)\\n';"
+        "t+='  '+base+'/sensor/temperature  (C, retained)\\n';"
+        "t+='  '+base+'/sensor/humidity     (%, retained)\\n';"
+        "t+='  '+base+'/door/state          (OPEN|CLOSED, retained)\\n';"
         "t+='  '+base+'/system/online      (online, retained)\\n';"
         "t+='  '+base+'/system/heartbeat   (json)\\n';"
         "t+='  '+base+'/system/state       (json, retained)\\n\\n';"
@@ -540,6 +661,14 @@ def html_page():
         "<h1>RP2350 Relay Control</h1>"
         "<div class='line'>Board IP: <b>" + ip_text + "</b></div>"
         "<div class='card'>"
+        "<h3>Sensors</h3>"
+        "<div class='line'>Temperature: <b id='tempVal'>--</b> C</div>"
+        "<div class='line'>Humidity: <b id='humVal'>--</b> %</div>"
+        "<div class='line'>Door 1 (DI1): <b id='doorVal'>--</b></div>"
+        "<div class='line'>Door 2 (DI2): <b id='door2Val'>--</b></div>"
+        "<div class='line'>DI3..DI8 active: <b id='diVals'>--</b></div>"
+        "</div>"
+        "<div class='card'>"
         "<h3>Relays</h3>" + "".join(relay_rows) +
         "<div class='line' style='margin-top:10px'>"
         "<button class='btn on' onclick='setAll(\"ON\")'>ALL ON</button> "
@@ -557,6 +686,14 @@ def html_page():
         "<div class='line'>MQTT status: <b id='mqttStatus'>-</b></div>"
         "<div class='line' id='saveResult'></div>"
         "<div class='line' id='testResult'></div>"
+        "<h4>DI3..DI8 Door Contacts</h4>"
+        "<div class='line'>Shows real contact state for door locks: CLOSED/OPEN.</div>"
+        "<div class='line'>DI3: <b id='diState3'>--</b> | Logic <button class='btn on' onclick='setDiMode(3,\"HIGH\")'>ACTIVE=CLOSED</button> <button class='btn off' onclick='setDiMode(3,\"LOW\")'>ACTIVE=OPEN</button> <span id='diMode3'>-</span></div>"
+        "<div class='line'>DI4: <b id='diState4'>--</b> | Logic <button class='btn on' onclick='setDiMode(4,\"HIGH\")'>ACTIVE=CLOSED</button> <button class='btn off' onclick='setDiMode(4,\"LOW\")'>ACTIVE=OPEN</button> <span id='diMode4'>-</span></div>"
+        "<div class='line'>DI5: <b id='diState5'>--</b> | Logic <button class='btn on' onclick='setDiMode(5,\"HIGH\")'>ACTIVE=CLOSED</button> <button class='btn off' onclick='setDiMode(5,\"LOW\")'>ACTIVE=OPEN</button> <span id='diMode5'>-</span></div>"
+        "<div class='line'>DI6: <b id='diState6'>--</b> | Logic <button class='btn on' onclick='setDiMode(6,\"HIGH\")'>ACTIVE=CLOSED</button> <button class='btn off' onclick='setDiMode(6,\"LOW\")'>ACTIVE=OPEN</button> <span id='diMode6'>-</span></div>"
+        "<div class='line'>DI7: <b id='diState7'>--</b> | Logic <button class='btn on' onclick='setDiMode(7,\"HIGH\")'>ACTIVE=CLOSED</button> <button class='btn off' onclick='setDiMode(7,\"LOW\")'>ACTIVE=OPEN</button> <span id='diMode7'>-</span></div>"
+        "<div class='line'>DI8: <b id='diState8'>--</b> | Logic <button class='btn on' onclick='setDiMode(8,\"HIGH\")'>ACTIVE=CLOSED</button> <button class='btn off' onclick='setDiMode(8,\"LOW\")'>ACTIVE=OPEN</button> <span id='diMode8'>-</span></div>"
         "<h4>How to control from any device</h4>" + tips +
         "</div>"
         "<script>"
@@ -564,7 +701,14 @@ def html_page():
         "async function jpost(u,obj){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)});return await r.json();}"
         "let mqttDirty=false;"
         "function paintState(arr){for(let i=1;i<=8;i++){const el=document.getElementById('r'+i);const on=arr[i-1]===1;el.textContent=on?'ON':'OFF';el.className='state '+(on?'on':'off');}}"
-        "async function refreshState(){try{const d=await jget('/api/state');paintState(d.relays||[]);document.getElementById('mqttStatus').textContent=d.mqtt_connected?'connected':'disconnected';"
+        "async function refreshState(){try{const d=await jget('/api/state');paintState(d.relays||[]);"
+        "document.getElementById('tempVal').textContent=(d.temp_c==null)?'--':Number(d.temp_c).toFixed(1);"
+        "document.getElementById('humVal').textContent=(d.hum_pct==null)?'--':Number(d.hum_pct).toFixed(1);"
+        "document.getElementById('doorVal').textContent=(d.door_closed===1)?'CLOSED':((d.door_closed===0)?'OPEN':'--');"
+        "document.getElementById('door2Val').textContent=(d.door2_closed===1)?'CLOSED':((d.door2_closed===0)?'OPEN':'--');"
+        "if(d.di&&d.di.length===6){document.getElementById('diVals').textContent=d.di.map((v,i)=>'DI'+(i+3)+':'+(v?'CLOSED':'OPEN')).join('  ');for(let i=0;i<6;i++){document.getElementById('diState'+(i+3)).textContent=d.di[i]?'CLOSED':'OPEN';}}"
+        "if(d.di_pull_modes&&d.di_pull_modes.length===6){for(let i=0;i<6;i++){document.getElementById('diMode'+(i+3)).textContent=(d.di_pull_modes[i]===1)?'ACTIVE=CLOSED':'ACTIVE=OPEN';}}"
+        "document.getElementById('mqttStatus').textContent=d.mqtt_connected?'connected':'disconnected';"
         "document.getElementById('mqttStatus').className=d.mqtt_connected?'ok':'bad';"
         "if(!mqttDirty){"
         "document.getElementById('mqttEnabled').checked=!!d.mqtt_enabled;"
@@ -575,6 +719,7 @@ def html_page():
         "renderTips();}catch(e){document.getElementById('mqttStatus').textContent='offline';document.getElementById('mqttStatus').className='bad';}}"
         "async function setRelay(n,s){await jpost('/api/relay',{relay:n,state:s});setTimeout(refreshState,60);}"
         "async function setAll(s){await jpost('/api/relay',{all:s});setTimeout(refreshState,60);}"
+        "async function setDiMode(di,mode){await jpost('/api/di/config',{di:di,mode:mode});setTimeout(refreshState,80);}"
         "async function saveMqtt(){const payload={enabled:document.getElementById('mqttEnabled').checked,broker_ip:document.getElementById('brokerIp').value.trim(),broker_port:parseInt(document.getElementById('brokerPort').value,10),base_topic:document.getElementById('baseTopic').value.trim()};"
         "const r=await jpost('/api/mqtt/config',payload);document.getElementById('saveResult').textContent=r.ok?'Saved':'Save error';if(r.ok){mqttDirty=false;}renderTips();setTimeout(refreshState,150);}"
         "async function testMqtt(){try{const r=await jpost('/api/mqtt/test',{});document.getElementById('testResult').textContent=r.ok?('Publish OK: '+r.topic+' '+r.payload):('Test error: '+(r.error||'unknown'));}catch(e){document.getElementById('testResult').textContent='Test request failed';}}"
@@ -595,6 +740,12 @@ def html_page():
 def state_json_response():
     payload = {
         "relays": [relays[i].value() for i in range(8)],
+        "temp_c": dht_temp,
+        "hum_pct": dht_hum,
+        "door_closed": door_state,
+        "door2_closed": door2_state,
+        "di": di_states,
+        "di_pull_modes": mqtt_cfg["di_pull_modes"],
         "mqtt_connected": mqtt_connected,
         "mqtt_enabled": mqtt_cfg["enabled"],
         "broker_ip": mqtt_cfg["broker_ip"],
@@ -736,6 +887,35 @@ def handle_api_mqtt_test():
         return json_response({"ok": False, "error": "publish_failed"}, 500)
 
 
+def apply_di_pull_mode(di_num, mode_text):
+    if di_num < 3 or di_num > 8:
+        return False
+    idx = di_num - 3
+    mode = str(mode_text).strip().upper()
+    if mode == "HIGH":
+        di_input_pins[idx] = Pin(DI_PINS[idx], Pin.IN, Pin.PULL_UP)
+        mqtt_cfg["di_pull_modes"][idx] = 1
+    elif mode == "LOW":
+        di_input_pins[idx] = Pin(DI_PINS[idx], Pin.IN, Pin.PULL_DOWN)
+        mqtt_cfg["di_pull_modes"][idx] = 0
+    else:
+        return False
+    save_mqtt_config()
+    return True
+
+
+def handle_api_di_config(body_text):
+    try:
+        d = json.loads(body_text)
+        di = int(d.get("di", 0))
+        mode = str(d.get("mode", ""))
+    except:
+        return json_response({"ok": False, "error": "args"}, 400)
+    if not apply_di_pull_mode(di, mode):
+        return json_response({"ok": False, "error": "args"}, 400)
+    return json_response({"ok": True})
+
+
 def handle_http_request(req_bytes):
     method, path, headers, body = parse_http(req_bytes)
     if method is None:
@@ -755,6 +935,9 @@ def handle_http_request(req_bytes):
 
     if method == "POST" and path == "/api/mqtt/test":
         return handle_api_mqtt_test()
+
+    if method == "POST" and path == "/api/di/config":
+        return handle_api_di_config(body)
 
     return b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\nConnection: close\r\n\r\n404"
 
@@ -819,6 +1002,10 @@ def http_loop_step():
 
 # ===================== Init =====================
 relays = [Pin(p, Pin.OUT, value=0) for p in RELAY_PINS]
+door_pin = Pin(DOOR1_PIN, Pin.IN, Pin.PULL_UP)
+door2_pin = Pin(DOOR2_PIN, Pin.IN, Pin.PULL_UP)
+di_input_pins = [Pin(p, Pin.IN, Pin.PULL_UP) for p in DI_PINS]
+dht_sensor = dht.DHT22(Pin(DHT_PIN))
 
 cs = Pin(SPI_CS, Pin.OUT, value=1)
 rst = Pin(W5500_RST, Pin.OUT)
@@ -839,6 +1026,11 @@ w5500.set_ip(IP)
 
 load_mqtt_config()
 
+# Apply saved pull mode for DI3..DI8 after loading config
+for i in range(6):
+    pull_mode = Pin.PULL_UP if mqtt_cfg["di_pull_modes"][i] == 1 else Pin.PULL_DOWN
+    di_input_pins[i] = Pin(DI_PINS[i], Pin.IN, pull_mode)
+
 log("Fast Web UI firmware started")
 log("HTTP: http://%d.%d.%d.%d" % tuple(IP))
 log("MQTT enabled: %s" % mqtt_cfg["enabled"])
@@ -846,6 +1038,7 @@ log("MQTT enabled: %s" % mqtt_cfg["enabled"])
 # ===================== Main loop =====================
 while True:
     try:
+        sensor_loop_step()
         mqtt_loop_step()
         http_loop_step()
         time.sleep_ms(10)
