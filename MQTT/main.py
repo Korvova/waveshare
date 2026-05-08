@@ -12,6 +12,8 @@ from w5500_simple import W5500
 import time
 import json
 import dht
+import onewire
+import ds18x20
 
 # ===================== Hardware =====================
 SPI_SCK = 34
@@ -21,6 +23,7 @@ SPI_CS = 33
 W5500_RST = 25
 RELAY_PINS = [17, 18, 19, 20, 21, 22, 23, 24]
 DHT_PIN = 42
+DHT2_PIN = 41
 DOOR1_PIN = 9   # DI1
 DOOR2_PIN = 10  # DI2
 DI_PINS = [11, 12, 13, 14, 15, 16]  # DI3..DI8
@@ -66,6 +69,8 @@ last_sensor_poll_ms = 0
 dht_last_read_ms = 0
 dht_temp = None
 dht_hum = None
+dht2_temp = None
+ds18_last_read_ms = 0
 door_state = None
 door2_state = None
 di_states = [None, None, None, None, None, None]
@@ -155,6 +160,10 @@ def topic_hum():
     return "%s/sensor/humidity" % mqtt_cfg["base_topic"]
 
 
+def topic_temp2():
+    return "%s/sensor2/temperature" % mqtt_cfg["base_topic"]
+
+
 def topic_door():
     return "%s/door/state" % mqtt_cfg["base_topic"]
 
@@ -242,6 +251,8 @@ def mqtt_publish_sensor_values():
         mqtt_publish(topic_temp(), ("%.1f" % dht_temp), retain=True)
     if dht_hum is not None:
         mqtt_publish(topic_hum(), ("%.1f" % dht_hum), retain=True)
+    if dht2_temp is not None:
+        mqtt_publish(topic_temp2(), ("%.1f" % dht2_temp), retain=True)
     if door_state is not None:
         mqtt_publish(topic_door(), "CLOSED" if door_state else "OPEN", retain=True)
     if door2_state is not None:
@@ -261,6 +272,7 @@ def mqtt_publish_state_snapshot():
     payload = {
         "relays": [relays[i].value() for i in range(8)],
         "temp_c": dht_temp,
+        "temp2_c": dht2_temp,
         "hum_pct": dht_hum,
         "door_closed": door_state,
         "door2_closed": door2_state,
@@ -432,7 +444,7 @@ def normalize_cmd(payload):
 
 
 def sensor_loop_step():
-    global dht_last_read_ms, dht_temp, dht_hum, door_state, door2_state, di_states, pzem_last_read_ms, pzem_cache, last_sensor_poll_ms
+    global dht_last_read_ms, dht_temp, dht_hum, dht2_temp, ds18_last_read_ms, door_state, door2_state, di_states, pzem_last_read_ms, pzem_cache, last_sensor_poll_ms
 
     now = time.ticks_ms()
     if time.ticks_diff(now, last_sensor_poll_ms) < SENSOR_POLL_MS:
@@ -517,6 +529,22 @@ def sensor_loop_step():
                 mqtt_publish_state_snapshot()
         except:
             # Keep last valid values on sensor errors.
+            pass
+
+    # Second temperature sensor on GPIO41: DS18B20 (1-Wire)
+    if ds18_roms and time.ticks_diff(now, ds18_last_read_ms) >= 3000:
+        try:
+            ds18.convert_temp()
+            time.sleep_ms(750)
+            new_temp2 = ds18.read_temp(ds18_roms[0])
+            if isinstance(new_temp2, float) and -55.0 <= new_temp2 <= 125.0:
+                if dht2_temp is None or abs(new_temp2 - dht2_temp) >= 0.1:
+                    dht2_temp = new_temp2
+                    if mqtt_connected:
+                        mqtt_publish_sensor_values()
+                        mqtt_publish_state_snapshot()
+            ds18_last_read_ms = now
+        except:
             pass
 
 
@@ -692,6 +720,7 @@ def html_page():
         "<div class='card'>"
         "<h3>Sensors</h3>"
         "<div class='line'>Temperature: <b id='tempVal'>--</b> C</div>"
+        "<div class='line'>Temperature 2 (GPIO41): <b id='temp2Val'>--</b> C</div>"
         "<div class='line'>Humidity: <b id='humVal'>--</b> %</div>"
         "<div class='line'>Voltage: <b id='pzV'>--</b> V | Current: <b id='pzA'>--</b> A | Power: <b id='pzW'>--</b> W</div>"
         "<div class='line'>Door 1 (DI1): <b id='doorVal'>--</b></div>"
@@ -733,6 +762,7 @@ def html_page():
         "function paintState(arr){for(let i=1;i<=8;i++){const el=document.getElementById('r'+i);const on=arr[i-1]===1;el.textContent=on?'ON':'OFF';el.className='state '+(on?'on':'off');}}"
         "async function refreshState(){try{const d=await jget('/api/state');paintState(d.relays||[]);"
         "document.getElementById('tempVal').textContent=(d.temp_c==null)?'--':Number(d.temp_c).toFixed(1);"
+        "document.getElementById('temp2Val').textContent=(d.temp2_c==null)?'--':Number(d.temp2_c).toFixed(1);"
         "document.getElementById('humVal').textContent=(d.hum_pct==null)?'--':Number(d.hum_pct).toFixed(1);"
         "if(d.pz){document.getElementById('pzV').textContent=(d.pz.v==null)?'--':Number(d.pz.v).toFixed(1);document.getElementById('pzA').textContent=(d.pz.a==null)?'--':Number(d.pz.a).toFixed(3);document.getElementById('pzW').textContent=(d.pz.w==null)?'--':Number(d.pz.w).toFixed(1);}"
         "document.getElementById('doorVal').textContent=(d.door_closed===1)?'CLOSED':((d.door_closed===0)?'OPEN':'--');"
@@ -772,6 +802,7 @@ def state_json_response():
     payload = {
         "relays": [relays[i].value() for i in range(8)],
         "temp_c": dht_temp,
+        "temp2_c": dht2_temp,
         "hum_pct": dht_hum,
         "door_closed": door_state,
         "door2_closed": door2_state,
@@ -1051,6 +1082,11 @@ door2_pin = Pin(DOOR2_PIN, Pin.IN, Pin.PULL_UP)
 di_input_pins = [Pin(p, Pin.IN, Pin.PULL_UP) for p in DI_PINS]
 pzem_uart = UART(1, baudrate=9600, tx=Pin(PZEM_TX), rx=Pin(PZEM_RX))
 dht_sensor = dht.DHT22(Pin(DHT_PIN))
+ds18 = ds18x20.DS18X20(onewire.OneWire(Pin(DHT2_PIN)))
+try:
+    ds18_roms = ds18.scan()
+except:
+    ds18_roms = []
 
 cs = Pin(SPI_CS, Pin.OUT, value=1)
 rst = Pin(W5500_RST, Pin.OUT)
