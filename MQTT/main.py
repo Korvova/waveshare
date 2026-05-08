@@ -7,7 +7,7 @@ Design:
 - MQTT is optional and can be enabled/disabled from the web page.
 """
 
-from machine import Pin, SoftSPI
+from machine import Pin, SoftSPI, UART
 from w5500_simple import W5500
 import time
 import json
@@ -24,6 +24,8 @@ DHT_PIN = 42
 DOOR1_PIN = 9   # DI1
 DOOR2_PIN = 10  # DI2
 DI_PINS = [11, 12, 13, 14, 15, 16]  # DI3..DI8
+PZEM_TX = 40
+PZEM_RX = 43
 
 # ===================== Network =====================
 MAC = [0x00, 0x08, 0xDC, 0x12, 0x34, 0x56]
@@ -67,6 +69,8 @@ dht_hum = None
 door_state = None
 door2_state = None
 di_states = [None, None, None, None, None, None]
+pzem_cache = {"v": None, "a": None, "w": None}
+pzem_last_read_ms = 0
 
 
 def log(msg):
@@ -262,6 +266,7 @@ def mqtt_publish_state_snapshot():
         "door2_closed": door2_state,
         "di": di_states,
         "di_pull_modes": mqtt_cfg["di_pull_modes"],
+        "pz": pzem_cache,
         "mqtt_enabled": mqtt_cfg["enabled"],
         "mqtt_connected": mqtt_connected,
         "broker_ip": mqtt_cfg["broker_ip"],
@@ -427,7 +432,7 @@ def normalize_cmd(payload):
 
 
 def sensor_loop_step():
-    global dht_last_read_ms, dht_temp, dht_hum, door_state, door2_state, di_states, last_sensor_poll_ms
+    global dht_last_read_ms, dht_temp, dht_hum, door_state, door2_state, di_states, pzem_last_read_ms, pzem_cache, last_sensor_poll_ms
 
     now = time.ticks_ms()
     if time.ticks_diff(now, last_sensor_poll_ms) < SENSOR_POLL_MS:
@@ -464,6 +469,30 @@ def sensor_loop_step():
             changed_di = True
     if changed_di and mqtt_connected:
         mqtt_publish_state_snapshot()
+
+    # PZEM read every 2 seconds
+    if time.ticks_diff(now, pzem_last_read_ms) >= 2000:
+        try:
+            while pzem_uart.any():
+                pzem_uart.read()
+            cmd = bytes([0x01, 0x04, 0x00, 0x00, 0x00, 0x0A])
+            crc = pzem_crc16(cmd)
+            req = cmd + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+            pzem_uart.write(req)
+            time.sleep_ms(120)
+            if pzem_uart.any():
+                r = pzem_uart.read()
+                if r and len(r) >= 25:
+                    pzem_cache = {
+                        "v": ((r[3] << 8) | r[4]) / 10.0,
+                        "a": ((r[5] << 8) | r[6] | (r[7] << 16) | (r[8] << 24)) / 1000.0,
+                        "w": ((r[9] << 8) | r[10] | (r[11] << 16) | (r[12] << 24)) / 10.0,
+                    }
+                    if mqtt_connected:
+                        mqtt_publish_state_snapshot()
+            pzem_last_read_ms = now
+        except:
+            pass
 
     # DHT read with cache interval
     if time.ticks_diff(now, dht_last_read_ms) >= DHT_READ_MS or dht_temp is None:
@@ -664,6 +693,7 @@ def html_page():
         "<h3>Sensors</h3>"
         "<div class='line'>Temperature: <b id='tempVal'>--</b> C</div>"
         "<div class='line'>Humidity: <b id='humVal'>--</b> %</div>"
+        "<div class='line'>Voltage: <b id='pzV'>--</b> V | Current: <b id='pzA'>--</b> A | Power: <b id='pzW'>--</b> W</div>"
         "<div class='line'>Door 1 (DI1): <b id='doorVal'>--</b></div>"
         "<div class='line'>Door 2 (DI2): <b id='door2Val'>--</b></div>"
         "<div class='line'>DI3..DI8 active: <b id='diVals'>--</b></div>"
@@ -704,6 +734,7 @@ def html_page():
         "async function refreshState(){try{const d=await jget('/api/state');paintState(d.relays||[]);"
         "document.getElementById('tempVal').textContent=(d.temp_c==null)?'--':Number(d.temp_c).toFixed(1);"
         "document.getElementById('humVal').textContent=(d.hum_pct==null)?'--':Number(d.hum_pct).toFixed(1);"
+        "if(d.pz){document.getElementById('pzV').textContent=(d.pz.v==null)?'--':Number(d.pz.v).toFixed(1);document.getElementById('pzA').textContent=(d.pz.a==null)?'--':Number(d.pz.a).toFixed(3);document.getElementById('pzW').textContent=(d.pz.w==null)?'--':Number(d.pz.w).toFixed(1);}"
         "document.getElementById('doorVal').textContent=(d.door_closed===1)?'CLOSED':((d.door_closed===0)?'OPEN':'--');"
         "document.getElementById('door2Val').textContent=(d.door2_closed===1)?'CLOSED':((d.door2_closed===0)?'OPEN':'--');"
         "if(d.di&&d.di.length===6){document.getElementById('diVals').textContent=d.di.map((v,i)=>'DI'+(i+3)+':'+(v?'CLOSED':'OPEN')).join('  ');for(let i=0;i<6;i++){document.getElementById('diState'+(i+3)).textContent=d.di[i]?'CLOSED':'OPEN';}}"
@@ -746,6 +777,7 @@ def state_json_response():
         "door2_closed": door2_state,
         "di": di_states,
         "di_pull_modes": mqtt_cfg["di_pull_modes"],
+        "pz": pzem_cache,
         "mqtt_connected": mqtt_connected,
         "mqtt_enabled": mqtt_cfg["enabled"],
         "broker_ip": mqtt_cfg["broker_ip"],
@@ -767,6 +799,18 @@ def json_response(obj, code=200):
         line = "HTTP/1.1 500 Internal Server Error"
     h = "%s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % (line, len(txt))
     return h.encode() + txt.encode()
+
+
+def pzem_crc16(data):
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc
 
 
 def parse_http(req_bytes):
@@ -1005,6 +1049,7 @@ relays = [Pin(p, Pin.OUT, value=0) for p in RELAY_PINS]
 door_pin = Pin(DOOR1_PIN, Pin.IN, Pin.PULL_UP)
 door2_pin = Pin(DOOR2_PIN, Pin.IN, Pin.PULL_UP)
 di_input_pins = [Pin(p, Pin.IN, Pin.PULL_UP) for p in DI_PINS]
+pzem_uart = UART(1, baudrate=9600, tx=Pin(PZEM_TX), rx=Pin(PZEM_RX))
 dht_sensor = dht.DHT22(Pin(DHT_PIN))
 
 cs = Pin(SPI_CS, Pin.OUT, value=1)
