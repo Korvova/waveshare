@@ -49,6 +49,8 @@ CLIENT_ID = "rp2350-relay-01"
 HEARTBEAT_MS = 15000
 SENSOR_POLL_MS = 2000
 DHT_READ_MS = 30000
+DS18_READ_MS = 3000
+DS18_SCAN_MS = 5000
 
 mqtt_cfg = {
     "enabled": False,
@@ -70,7 +72,11 @@ dht_last_read_ms = 0
 dht_temp = None
 dht_hum = None
 dht2_temp = None
+ds18_temps = []
 ds18_last_read_ms = 0
+ds18_last_scan_ms = 0
+ds18_roms = []
+dht_fail_count = 0
 door_state = None
 door2_state = None
 di_states = [None, None, None, None, None, None]
@@ -80,6 +86,22 @@ pzem_last_read_ms = 0
 
 def log(msg):
     print(msg)
+
+
+def scan_ds18(force_log=False):
+    global ds18_roms, ds18_last_scan_ms
+    try:
+        found = ds18.scan()
+        ds18_roms = found if found else []
+        ds18_last_scan_ms = time.ticks_ms()
+        if force_log or ds18_roms:
+            log("DS18B20 devices: %d" % len(ds18_roms))
+    except:
+        ds18_roms = []
+        ds18_last_scan_ms = time.ticks_ms()
+        if force_log:
+            log("DS18B20 scan failed")
+    return len(ds18_roms)
 
 
 def load_mqtt_config():
@@ -273,6 +295,8 @@ def mqtt_publish_state_snapshot():
         "relays": [relays[i].value() for i in range(8)],
         "temp_c": dht_temp,
         "temp2_c": dht2_temp,
+        "ds18_temps": ds18_temps,
+        "ds18_count": len(ds18_roms),
         "hum_pct": dht_hum,
         "door_closed": door_state,
         "door2_closed": door2_state,
@@ -444,7 +468,7 @@ def normalize_cmd(payload):
 
 
 def sensor_loop_step():
-    global dht_last_read_ms, dht_temp, dht_hum, dht2_temp, ds18_last_read_ms, door_state, door2_state, di_states, pzem_last_read_ms, pzem_cache, last_sensor_poll_ms
+    global dht_last_read_ms, dht_temp, dht_hum, dht2_temp, ds18_temps, ds18_last_read_ms, ds18_last_scan_ms, ds18_roms, dht_fail_count, dht_sensor, door_state, door2_state, di_states, pzem_last_read_ms, pzem_cache, last_sensor_poll_ms
 
     now = time.ticks_ms()
     if time.ticks_diff(now, last_sensor_poll_ms) < SENSOR_POLL_MS:
@@ -513,6 +537,7 @@ def sensor_loop_step():
             new_temp = dht_sensor.temperature()
             new_hum = dht_sensor.humidity()
             dht_last_read_ms = now
+            dht_fail_count = 0
 
             changed = (
                 dht_temp is None
@@ -528,24 +553,53 @@ def sensor_loop_step():
                 mqtt_publish_sensor_values()
                 mqtt_publish_state_snapshot()
         except:
-            # Keep last valid values on sensor errors.
-            pass
+            # Auto-recover DHT without rebooting board.
+            dht_fail_count += 1
+            if dht_fail_count >= 3:
+                try:
+                    dht_sensor = dht.DHT22(Pin(DHT_PIN))
+                    dht_fail_count = 0
+                    # force quick retry after re-init
+                    dht_last_read_ms = time.ticks_add(now, -DHT_READ_MS)
+                except:
+                    pass
 
     # Second temperature sensor on GPIO41: DS18B20 (1-Wire)
-    if ds18_roms and time.ticks_diff(now, ds18_last_read_ms) >= 3000:
+    if (not ds18_roms) and time.ticks_diff(now, ds18_last_scan_ms) >= DS18_SCAN_MS:
+        scan_ds18()
+
+    if ds18_roms and time.ticks_diff(now, ds18_last_read_ms) >= DS18_READ_MS:
         try:
             ds18.convert_temp()
             time.sleep_ms(750)
-            new_temp2 = ds18.read_temp(ds18_roms[0])
-            if isinstance(new_temp2, float) and -55.0 <= new_temp2 <= 125.0:
-                if dht2_temp is None or abs(new_temp2 - dht2_temp) >= 0.1:
-                    dht2_temp = new_temp2
-                    if mqtt_connected:
-                        mqtt_publish_sensor_values()
-                        mqtt_publish_state_snapshot()
+            new_temps = []
+            changed = len(ds18_temps) != len(ds18_roms)
+            for i in range(len(ds18_roms)):
+                temp = ds18.read_temp(ds18_roms[i])
+                if isinstance(temp, float) and -55.0 <= temp <= 125.0:
+                    new_temps.append(temp)
+                    if not changed:
+                        previous = ds18_temps[i]
+                        if previous is None or abs(temp - previous) >= 0.1:
+                            changed = True
+                else:
+                    new_temps.append(None)
+                    if (not changed) and ds18_temps[i] is not None:
+                        changed = True
+            if changed:
+                ds18_temps = new_temps
+                dht2_temp = ds18_temps[0] if ds18_temps else None
+                if mqtt_connected:
+                    mqtt_publish_sensor_values()
+                    mqtt_publish_state_snapshot()
             ds18_last_read_ms = now
         except:
-            pass
+            ds18_roms = []
+            ds18_temps = []
+            dht2_temp = None
+            ds18_last_read_ms = now
+            if mqtt_connected:
+                mqtt_publish_state_snapshot()
 
 
 def apply_relay(idx, cmd, source="unknown"):
@@ -654,12 +708,15 @@ def html_page():
     for i in range(8):
         state = "ON" if relays[i].value() else "OFF"
         css = "on" if state == "ON" else "off"
+        relay_name = "Реле %d" % (i + 1)
+        if i == 6:
+            relay_name = "Реле 7 (вентилятор)"
         relay_rows.append(
-            "<div class='relay'>Relay %d: <span id='r%d' class='state %s'>%s</span> "
+            "<div class='relay'>%s: <span id='r%d' class='state %s'>%s</span> "
             "<button class='btn on' onclick='setRelay(%d,\"ON\")'>ON</button> "
             "<button class='btn off' onclick='setRelay(%d,\"OFF\")'>OFF</button> "
             "<button class='btn tgl' onclick='setRelay(%d,\"TOGGLE\")'>TOGGLE</button>"
-            "</div>" % (i + 1, i + 1, css, state, i + 1, i + 1, i + 1)
+            "</div>" % (relay_name, i + 1, css, state, i + 1, i + 1, i + 1)
         )
 
     ip_text = "%d.%d.%d.%d" % (IP[0], IP[1], IP[2], IP[3])
@@ -711,6 +768,8 @@ def html_page():
         ".btn{border:none;padding:6px 10px;border-radius:8px;color:#fff;cursor:pointer}"
         ".btn.on{background:#16a34a}.btn.off{background:#dc2626}.btn.tgl{background:#2563eb}"
         ".line{margin:6px 0}.ok{color:#166534}.bad{color:#b91c1c}"
+        ".sensor-block{background:#f1f5f9;border-radius:8px;padding:8px 10px;margin:8px 0}"
+        ".sensor-title{font-weight:bold;margin-bottom:4px}"
         "input{padding:6px;border:1px solid #cbd5e1;border-radius:6px;width:180px}"
         "label{display:inline-block;min-width:110px}"
         "pre{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px;white-space:pre-wrap}"
@@ -719,9 +778,13 @@ def html_page():
         "<div class='line'>Board IP: <b>" + ip_text + "</b></div>"
         "<div class='card'>"
         "<h3>Sensors</h3>"
+        "<div class='sensor-block'><div class='sensor-title'>DHT22 (GPIO42)</div>"
         "<div class='line'>Temperature: <b id='tempVal'>--</b> C</div>"
-        "<div class='line'>Temperature 2 (GPIO41): <b id='temp2Val'>--</b> C</div>"
-        "<div class='line'>Humidity: <b id='humVal'>--</b> %</div>"
+        "<div class='line'>Humidity: <b id='humVal'>--</b> %</div></div>"
+        "<div class='sensor-block'><div class='sensor-title'>DS18B20 (GPIO41)</div>"
+        "<div class='line'>Temperature 2: <b id='temp2Val'>--</b> C</div>"
+        "<div class='line'>Detected: <b id='ds18CountVal'>--</b></div>"
+        "<div class='line'>All DS18B20: <b id='ds18ListVal'>--</b></div></div>"
         "<div class='line'>Voltage: <b id='pzV'>--</b> V | Current: <b id='pzA'>--</b> A | Power: <b id='pzW'>--</b> W</div>"
         "<div class='line'>Door 1 (DI1): <b id='doorVal'>--</b></div>"
         "<div class='line'>Door 2 (DI2): <b id='door2Val'>--</b></div>"
@@ -763,6 +826,8 @@ def html_page():
         "async function refreshState(){try{const d=await jget('/api/state');paintState(d.relays||[]);"
         "document.getElementById('tempVal').textContent=(d.temp_c==null)?'--':Number(d.temp_c).toFixed(1);"
         "document.getElementById('temp2Val').textContent=(d.temp2_c==null)?'--':Number(d.temp2_c).toFixed(1);"
+        "document.getElementById('ds18CountVal').textContent=(d.ds18_count==null)?'--':d.ds18_count;"
+        "document.getElementById('ds18ListVal').textContent=(d.ds18_temps&&d.ds18_temps.length)?d.ds18_temps.map((v,i)=>'T'+(i+1)+': '+(v==null?'--':Number(v).toFixed(1)+' C')).join(' | '):'--';"
         "document.getElementById('humVal').textContent=(d.hum_pct==null)?'--':Number(d.hum_pct).toFixed(1);"
         "if(d.pz){document.getElementById('pzV').textContent=(d.pz.v==null)?'--':Number(d.pz.v).toFixed(1);document.getElementById('pzA').textContent=(d.pz.a==null)?'--':Number(d.pz.a).toFixed(3);document.getElementById('pzW').textContent=(d.pz.w==null)?'--':Number(d.pz.w).toFixed(1);}"
         "document.getElementById('doorVal').textContent=(d.door_closed===1)?'CLOSED':((d.door_closed===0)?'OPEN':'--');"
@@ -803,6 +868,8 @@ def state_json_response():
         "relays": [relays[i].value() for i in range(8)],
         "temp_c": dht_temp,
         "temp2_c": dht2_temp,
+        "ds18_temps": ds18_temps,
+        "ds18_count": len(ds18_roms),
         "hum_pct": dht_hum,
         "door_closed": door_state,
         "door2_closed": door2_state,
@@ -1083,10 +1150,7 @@ di_input_pins = [Pin(p, Pin.IN, Pin.PULL_UP) for p in DI_PINS]
 pzem_uart = UART(1, baudrate=9600, tx=Pin(PZEM_TX), rx=Pin(PZEM_RX))
 dht_sensor = dht.DHT22(Pin(DHT_PIN))
 ds18 = ds18x20.DS18X20(onewire.OneWire(Pin(DHT2_PIN)))
-try:
-    ds18_roms = ds18.scan()
-except:
-    ds18_roms = []
+scan_ds18(force_log=True)
 
 cs = Pin(SPI_CS, Pin.OUT, value=1)
 rst = Pin(W5500_RST, Pin.OUT)
