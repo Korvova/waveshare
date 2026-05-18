@@ -60,6 +60,7 @@ SENSOR_POLL_MS = 2000
 DHT_READ_MS = 30000
 DS18_READ_MS = 3000
 DS18_SCAN_MS = 5000
+TOGGLE_PULSE_MS = 5000
 
 mqtt_cfg = {
     "enabled": False,
@@ -93,6 +94,8 @@ pzem_cache = {"v": None, "a": None, "w": None}
 pzem_last_read_ms = 0
 network_reset_pin = None
 network_reset_low_since_ms = None
+relay_restore_at_ms = [None, None, None, None, None, None, None, None]
+relay_restore_values = [None, None, None, None, None, None, None, None]
 
 
 def log(msg):
@@ -689,9 +692,14 @@ def apply_relay(idx, cmd, source="unknown"):
         return
 
     if cmd == 2:
-        val = 0 if relays[idx].value() else 1
+        old_val = relays[idx].value()
+        val = 0 if old_val else 1
+        relay_restore_values[idx] = old_val
+        relay_restore_at_ms[idx] = time.ticks_add(time.ticks_ms(), TOGGLE_PULSE_MS)
     else:
         val = 1 if cmd else 0
+        relay_restore_values[idx] = None
+        relay_restore_at_ms[idx] = None
 
     relays[idx].value(val)
     if mqtt_connected:
@@ -702,6 +710,24 @@ def apply_relay(idx, cmd, source="unknown"):
 def apply_all(cmd, source="unknown"):
     for i in range(8):
         apply_relay(i, cmd, source)
+
+
+def relay_pulse_loop_step():
+    changed = False
+    now = time.ticks_ms()
+    for i in range(8):
+        restore_at = relay_restore_at_ms[i]
+        if restore_at is not None and time.ticks_diff(now, restore_at) >= 0:
+            restore_val = relay_restore_values[i]
+            relay_restore_at_ms[i] = None
+            relay_restore_values[i] = None
+            if restore_val is not None and relays[i].value() != restore_val:
+                relays[i].value(restore_val)
+                changed = True
+                if mqtt_connected:
+                    mqtt_publish_relay_state(i + 1)
+    if changed and mqtt_connected:
+        mqtt_publish_state_snapshot()
 
 
 def mqtt_handle_packet(packet):
@@ -797,7 +823,7 @@ def html_page():
             "<div class='relay'>%s: <span id='r%d' class='state %s'>%s</span> "
             "<button class='btn on' onclick='setRelay(%d,\"ON\")'>ON</button> "
             "<button class='btn off' onclick='setRelay(%d,\"OFF\")'>OFF</button> "
-            "<button class='btn tgl' onclick='setRelay(%d,\"TOGGLE\")'>TOGGLE</button>"
+            "<button class='btn tgl' onclick='setRelay(%d,\"TOGGLE\")'>TOGGLE 5s</button>"
             "</div>" % (relay_name, i + 1, css, state, i + 1, i + 1, i + 1)
         )
 
@@ -819,8 +845,8 @@ def html_page():
         "t+='  '+base+'/system/heartbeat   (json)\\n';"
         "t+='  '+base+'/system/state       (json, retained)\\n\\n';"
         "t+='subscribe by board (control):\\n';"
-        "t+='  '+base+'/relay/<1..8>/set   (ON|OFF|TOGGLE|1|0)\\n';"
-        "t+='  '+base+'/relay/all/set      (ON|OFF|TOGGLE|1|0)\\n';"
+        "t+='  '+base+'/relay/<1..8>/set   (ON|OFF|TOGGLE|1|0; TOGGLE returns after 5s)\\n';"
+        "t+='  '+base+'/relay/all/set      (ON|OFF|TOGGLE|1|0; TOGGLE returns after 5s)\\n';"
         "t+='  '+base+'/system/get         (any payload => publish state)\\n\\n';"
         "t+='MQTT publish examples\\n';"
         "t+='mosquitto_pub -h '+ip+' -p '+p+' -t '+base+'/relay/1/set -m ON\\n';"
@@ -1342,6 +1368,7 @@ log("MQTT enabled: %s" % mqtt_cfg["enabled"])
 while True:
     try:
         network_reset_loop_step()
+        relay_pulse_loop_step()
         sensor_loop_step()
         mqtt_loop_step()
         http_loop_step()

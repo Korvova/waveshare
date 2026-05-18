@@ -6,6 +6,7 @@
 
 - Быстрый веб-интерфейс: `http://192.168.1.100`
 - Управление реле 1..8 (ON/OFF/TOGGLE) без перезагрузки страницы
+- `TOGGLE` временно переключает реле на 5 секунд, затем возвращает прежнее состояние
 - Настройки MQTT прямо в вебке (Enable, Broker IP, Broker Port, Base Topic)
 - Кнопка `Test MQTT` в вебке
 - MQTT publish + subscribe (двусторонняя работа)
@@ -41,8 +42,8 @@
 - `<base>/system/state` (JSON snapshot, retained)
 
 Подписывается плата:
-- `<base>/relay/<1..8>/set` (`ON|OFF|TOGGLE|1|0|TRUE|FALSE`)
-- `<base>/relay/all/set` (`ON|OFF|TOGGLE|1|0|TRUE|FALSE`)
+- `<base>/relay/<1..8>/set` (`ON|OFF|TOGGLE|1|0|TRUE|FALSE`), `TOGGLE` возвращает реле назад через 5 секунд
+- `<base>/relay/all/set` (`ON|OFF|TOGGLE|1|0|TRUE|FALSE`), `TOGGLE` возвращает реле назад через 5 секунд
 - `<base>/system/get` (любой payload -> плата публикует state/heartbeat)
 
 `<base>` = значение поля `Base Topic` в вебке (по умолчанию `waveshare`).
