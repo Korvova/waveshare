@@ -8,13 +8,16 @@ try {
     Write-Host "=== Обновление Unirack-1 ===" -ForegroundColor Cyan
 
     # 0. Найти mpremote (ставится командой: pip install mpremote)
-    $mp = $null
-    if (Get-Command mpremote -ErrorAction SilentlyContinue) { $mp = @("mpremote") }
+    $mpExe = $null
+    $mpPre = @()
+    if (Get-Command mpremote -ErrorAction SilentlyContinue) {
+        $mpExe = "mpremote"
+    }
     elseif (Get-Command python -ErrorAction SilentlyContinue) {
         python -m mpremote version *> $null
-        if ($LASTEXITCODE -eq 0) { $mp = @("python", "-m", "mpremote") }
+        if ($LASTEXITCODE -eq 0) { $mpExe = "python"; $mpPre = @("-m", "mpremote") }
     }
-    if (-not $mp) {
+    if (-not $mpExe) {
         throw ("Не найден mpremote. Установите Python с python.org (галочка 'Add to PATH'), " +
                "затем в командной строке выполните:  pip install mpremote  — и запустите снова.")
     }
@@ -30,7 +33,7 @@ try {
     $com = [regex]::Match($dev.FriendlyName, 'COM\d+').Value
     Write-Host "Устройство найдено на $com" -ForegroundColor Cyan
 
-    function Invoke-Mp { & $mp[0] $mp[1..($mp.Count-1)] @args; return $LASTEXITCODE }
+    function Invoke-Mp { & $script:mpExe @script:mpPre @args; return $LASTEXITCODE }
 
     # 2. Залить файлы (с повторами: плата может ещё загружаться)
     foreach ($f in @("w5500_simple.py", "main.py")) {
@@ -47,7 +50,7 @@ try {
     }
 
     # 3. Сверить размеры файлов на плате
-    $out = (& $mp[0] $mp[1..($mp.Count-1)] connect $com exec "import os; print(os.stat('w5500_simple.py')[6], os.stat('main.py')[6])" | Out-String).Trim() -split '\s+'
+    $out = (& $mpExe @mpPre connect $com exec "import os; print(os.stat('w5500_simple.py')[6], os.stat('main.py')[6])" | Out-String).Trim() -split '\s+'
     $expW = (Get-Item w5500_simple.py).Length
     $expM = (Get-Item main.py).Length
     if ([int]$out[0] -ne $expW -or [int]$out[1] -ne $expM) {
@@ -57,7 +60,7 @@ try {
     # 4. Перезагрузить и показать новый MAC (обрыв связи при reset — это норма)
     $mac = ""
     try {
-        $mac = (& $mp[0] $mp[1..($mp.Count-1)] connect $com exec "import machine; u=machine.unique_id(); print('02:08:DC:%02X:%02X:%02X' % (u[-3], u[-2], u[-1]))" | Out-String).Trim()
+        $mac = (& $mpExe @mpPre connect $com exec "import machine; u=machine.unique_id(); print('02:08:DC:%02X:%02X:%02X' % (u[-3], u[-2], u[-1]))" | Out-String).Trim()
     } catch {}
     try { Invoke-Mp connect $com exec "import machine; machine.reset()" *> $null } catch {}
 
