@@ -14,7 +14,28 @@ if (-not $dev) {
 $com = [regex]::Match($dev.FriendlyName, 'COM\d+').Value
 Write-Host "Плата найдена на $com" -ForegroundColor Cyan
 
+# Остановить работающую прошивку (Ctrl-C в порт): голые except в main.py
+# могут глотать прерывание, и mpremote падает с "could not enter raw repl".
+function Stop-Firmware([string]$port) {
+    $sp = $null
+    try {
+        $sp = New-Object System.IO.Ports.SerialPort $port, 115200
+        $sp.DtrEnable = $true
+        $sp.RtsEnable = $true
+        $sp.Open()
+        Start-Sleep -Milliseconds 200
+        $bytes = [byte[]](13, 3, 3)   # Enter + Ctrl-C + Ctrl-C
+        foreach ($i in 1..5) {
+            $sp.Write($bytes, 0, 3)
+            Start-Sleep -Milliseconds 300
+        }
+    } catch {}
+    finally { try { if ($sp -and $sp.IsOpen) { $sp.Close() } } catch {} }
+    Start-Sleep -Milliseconds 300
+}
+
 # 2. Залить файлы (с повторами: плата может ещё грузиться после подключения)
+Stop-Firmware $com
 foreach ($f in @("w5500_simple.py", "main.py")) {
     $done = $false
     foreach ($try in 1..4) {
@@ -22,6 +43,7 @@ foreach ($f in @("w5500_simple.py", "main.py")) {
         if ($LASTEXITCODE -eq 0) { $done = $true; break }
         Write-Host "  повтор $try для $f..." -ForegroundColor Yellow
         Start-Sleep -Seconds 3
+        Stop-Firmware $com
     }
     if (-not $done) {
         Write-Host "ОШИБКА: не удалось скопировать $f" -ForegroundColor Red

@@ -35,7 +35,29 @@ try {
 
     function Invoke-Mp { & $script:mpExe @script:mpPre @args; return $LASTEXITCODE }
 
+    # Остановить работающую прошивку (Ctrl-C в порт), иначе mpremote может
+    # не пробиться к файлам ("could not enter raw repl").
+    function Stop-Firmware([string]$port) {
+        $sp = $null
+        try {
+            $sp = New-Object System.IO.Ports.SerialPort $port, 115200
+            $sp.DtrEnable = $true
+            $sp.RtsEnable = $true
+            $sp.Open()
+            Start-Sleep -Milliseconds 200
+            $bytes = [byte[]](13, 3, 3)   # Enter + Ctrl-C + Ctrl-C
+            foreach ($i in 1..5) {
+                $sp.Write($bytes, 0, 3)
+                Start-Sleep -Milliseconds 300
+            }
+        } catch {}
+        finally { try { if ($sp -and $sp.IsOpen) { $sp.Close() } } catch {} }
+        Start-Sleep -Milliseconds 300
+    }
+
     # 2. Залить файлы (с повторами: плата может ещё загружаться)
+    Write-Host "Останавливаю прошивку устройства..."
+    Stop-Firmware $com
     foreach ($f in @("w5500_simple.py", "main.py")) {
         $done = $false
         foreach ($try in 1..4) {
@@ -43,6 +65,7 @@ try {
             if ($code -eq 0) { $done = $true; break }
             Write-Host "  повтор $try для $f..." -ForegroundColor Yellow
             Start-Sleep -Seconds 3
+            Stop-Firmware $com
         }
         if (-not $done) {
             throw "Не удалось скопировать $f. Отключите/подключите USB и запустите снова."
