@@ -59,7 +59,10 @@ PZEM_TX = 40  # EM TX: energy monitor (PZEM-004T)
 PZEM_RX = 43  # EM RX
 
 # ===================== Network =====================
-MAC = [0x00, 0x08, 0xDC, 0x12, 0x34, 0x56]
+# Unique per-device MAC: locally administered address, last 3 bytes come
+# from the RP2350 unique chip ID, so every board differs out of the box.
+_uid = machine.unique_id()
+MAC = [0x02, 0x08, 0xDC, _uid[-3], _uid[-2], _uid[-1]]
 DEFAULT_IP = [192, 168, 1, 100]
 DEFAULT_GW = [192, 168, 1, 1]
 DEFAULT_SN = [255, 255, 255, 0]
@@ -81,7 +84,8 @@ SOCK_MQTT = 1
 
 # ===================== MQTT =====================
 KEEPALIVE_SEC = 30
-CLIENT_ID = "unirack1-relay-01"
+# Unique per-device client id (same chip-id suffix as the MAC).
+CLIENT_ID = "unirack1-%02x%02x%02x" % (MAC[3], MAC[4], MAC[5])
 HEARTBEAT_MS = 15000
 SENSOR_POLL_MS = 2000
 DHT_READ_MS = 30000
@@ -192,6 +196,10 @@ def parse_ip_string(ip_text):
 
 def ip_to_string(ip):
     return "%d.%d.%d.%d" % (ip[0], ip[1], ip[2], ip[3])
+
+
+def mac_to_string(mac):
+    return ":".join("%02X" % b for b in mac)
 
 
 def load_network_config():
@@ -941,7 +949,7 @@ def html_page():
         "pre{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px;white-space:pre-wrap}"
         "</style></head><body>"
         "<h1>Unirack-1</h1>"
-        "<div class='line'>Board IP: <b>" + ip_text + "</b></div>"
+        "<div class='line'>Board IP: <b>" + ip_text + "</b> | MAC: <b>" + mac_to_string(MAC) + "</b></div>"
         "<div class='card'>"
         "<h3>Board Network</h3>"
         "<div class='line'><label>Board IP</label><input id='boardIp' value=''></div>"
@@ -1075,6 +1083,7 @@ def state_json_response():
         "board_ip": ip_to_string(IP),
         "gateway": ip_to_string(GW),
         "subnet": ip_to_string(SN),
+        "mac": mac_to_string(MAC),
         "default_board_ip": ip_to_string(DEFAULT_IP),
         "network_reset_active": 1 if check_network_reset_pin() else 0,
     }
@@ -1414,6 +1423,7 @@ for i in range(6):
 network_reset_pin = di_input_pins[NETWORK_RESET_DI_IDX]
 
 log("Unirack-1 firmware started")
+log("MAC: %s" % mac_to_string(MAC))
 log("HTTP: http://%s" % ip_to_string(IP))
 log("MQTT enabled: %s" % mqtt_cfg["enabled"])
 

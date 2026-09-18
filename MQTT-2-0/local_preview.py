@@ -82,6 +82,7 @@ machine.Pin = _Pin
 machine.SoftSPI = _SoftSPI
 machine.UART = _UART
 machine.reset = _machine_reset
+machine.unique_id = lambda: b"\x12\x34\x56\x78\x9a\xbc\xde\xf0"
 
 
 class _W5500:
